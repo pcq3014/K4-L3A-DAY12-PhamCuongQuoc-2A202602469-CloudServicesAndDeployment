@@ -17,9 +17,10 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from utils.mock_llm import ask_llm
@@ -34,6 +35,7 @@ from .store import ConversationStore, get_redis_client
 
 SERVICE_NAME = "day12-agent"
 SERVICE_VERSION = "1.0.0"
+UI_FILE = Path(__file__).parent / "static" / "index.html"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -219,6 +221,35 @@ def ask(
         "cost_usd": result["cost_usd"],
         "tokens": {"in": result["tokens_in"], "out": result["tokens_out"]},
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# Giao diện web + lịch sử cho UI
+# ─────────────────────────────────────────────────────────────
+@app.get("/", include_in_schema=False)
+def ui():
+    """Trang chat tĩnh. Không nhúng secret — người dùng tự nhập API key."""
+    return FileResponse(UI_FILE, media_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/history")
+def history(
+    user_id: str = Depends(verify_api_key),
+    store: ConversationStore = Depends(get_store),
+):
+    """Lịch sử hội thoại của user (để UI khôi phục sau khi tải lại trang)."""
+    return {"user_id": user_id, "messages": store.get_history(user_id)}
+
+
+@app.delete("/history", status_code=204)
+def clear_history(
+    user_id: str = Depends(verify_api_key),
+    store: ConversationStore = Depends(get_store),
+):
+    """Bắt đầu cuộc trò chuyện mới. Không đụng tới chi phí đã ghi nhận."""
+    store.clear(user_id)
+    log_event("history_cleared", user_id=user_id)
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":

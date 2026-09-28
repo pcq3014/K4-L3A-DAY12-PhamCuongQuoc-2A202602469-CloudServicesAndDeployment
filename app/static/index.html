@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Day12 Agent</title>
+<meta name="description" content="Chat với AI agent Day 12 — có xác thực, rate limit và cost guard.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M9 12h14M9 17h10M9 22h6' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f0f2f5;
+    --border: #e2e5ea;
+    --text: #15181d;
+    --muted: #5d6673;
+    --accent: #2563eb;
+    --accent-text: #ffffff;
+    --accent-soft: #e8efff;
+    --user-bubble: #2563eb;
+    --user-text: #ffffff;
+    --ok: #15803d;
+    --ok-soft: #e7f6ec;
+    --warn: #b45309;
+    --warn-soft: #fdf3e3;
+    --err: #b91c1c;
+    --err-soft: #fdecec;
+    --shadow: 0 1px 2px rgb(16 24 40 / .06), 0 4px 16px rgb(16 24 40 / .06);
+    --radius: 14px;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1116;
+      --surface: #161a21;
+      --surface-2: #1d222b;
+      --border: #2a303b;
+      --text: #e8ebf0;
+      --muted: #97a0ad;
+      --accent: #5b8def;
+      --accent-text: #0b1020;
+      --accent-soft: #1b2944;
+      --user-bubble: #3b6fe0;
+      --user-text: #ffffff;
+      --ok: #4ade80;
+      --ok-soft: #13291c;
+      --warn: #fbbf24;
+      --warn-soft: #2e2410;
+      --err: #f87171;
+      --err-soft: #321616;
+      --shadow: 0 1px 2px rgb(0 0 0 / .3), 0 4px 16px rgb(0 0 0 / .25);
+      color-scheme: dark;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  /* ── Layout ─────────────────────────────────────────── */
+  .app {
+    height: 100dvh;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    max-width: 860px;
+    margin: 0 auto;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(8px);
+    position: sticky; top: 0; z-index: 2;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo {
+    width: 32px; height: 32px; border-radius: 9px; flex: none;
+    background: var(--accent); display: grid; place-items: center;
+  }
+  .brand h1 { font-size: 16px; margin: 0; line-height: 1.2; }
+  .brand p { margin: 0; font-size: 12px; color: var(--muted); }
+  .spacer { flex: 1; }
+
+  .pills { display: flex; gap: 6px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 500;
+    padding: 4px 10px; border-radius: 999px;
+    background: var(--surface-2); color: var(--muted);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill[data-state="ok"] { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+  .pill[data-state="down"] { color: var(--err); background: var(--err-soft); border-color: transparent; }
+  .pill[data-state="checking"] .dot { animation: pulse 1.2s ease-in-out infinite; }
+
+  .icon-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 34px; padding: 0 12px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--surface);
+    font-size: 13px; font-weight: 500;
+  }
+  .icon-btn:hover { background: var(--surface-2); }
+  .icon-btn svg { width: 16px; height: 16px; flex: none; }
+
+  /* ── Messages ───────────────────────────────────────── */
+  main { overflow-y: auto; padding: 20px 16px 8px; scroll-behavior: smooth; }
+  .log { display: flex; flex-direction: column; gap: 14px; }
+
+  .msg { display: flex; flex-direction: column; max-width: 82%; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.assistant { align-self: flex-start; }
+  .bubble {
+    padding: 10px 14px; border-radius: var(--radius);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .user .bubble { background: var(--user-bubble); color: var(--user-text); border-bottom-right-radius: 4px; }
+  .assistant .bubble {
+    background: var(--surface); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px; box-shadow: var(--shadow);
+  }
+  .meta { font-size: 11.5px; color: var(--muted); margin-top: 4px; padding: 0 4px; font-variant-numeric: tabular-nums; }
+
+  .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
+  .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: bounce 1.2s infinite; }
+  .typing span:nth-child(2) { animation-delay: .15s; }
+  .typing span:nth-child(3) { animation-delay: .3s; }
+
+  .empty { text-align: center; padding: 48px 8px 16px; color: var(--muted); }
+  .empty h2 { color: var(--text); font-size: 20px; margin: 0 0 6px; }
+  .empty p { margin: 0 auto 20px; max-width: 460px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .chip {
+    border: 1px solid var(--border); background: var(--surface);
+    border-radius: 999px; padding: 7px 14px; font-size: 13.5px;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--accent); }
+
+  .divider { text-align: center; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 10px; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+  /* ── Composer ───────────────────────────────────────── */
+  footer { padding: 8px 16px calc(12px + env(safe-area-inset-bottom)); }
+  .banner {
+    display: none; align-items: flex-start; gap: 10px;
+    padding: 10px 12px; margin-bottom: 8px; border-radius: 12px;
+    font-size: 13.5px;
+  }
+  .banner.show { display: flex; }
+  .banner[data-kind="warn"] { background: var(--warn-soft); color: var(--warn); }
+  .banner[data-kind="err"] { background: var(--err-soft); color: var(--err); }
+  .banner .text { flex: 1; }
+  .banner small { display: block; opacity: .8; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; margin-top: 2px; }
+  .banner button { background: none; border: 0; color: inherit; padding: 0 2px; font-size: 18px; line-height: 1; }
+
+  .composer {
+    display: flex; align-items: flex-end; gap: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: var(--shadow);
+  }
+  .composer:focus-within { border-color: var(--accent); }
+  .composer textarea {
+    flex: 1; border: 0; outline: 0; resize: none; background: transparent;
+    max-height: 180px; min-height: 24px; padding: 6px 0; line-height: 1.5;
+  }
+  .send {
+    width: 38px; height: 38px; border-radius: 11px; border: 0; flex: none;
+    background: var(--accent); color: var(--accent-text);
+    display: grid; place-items: center;
+  }
+  .send:disabled { opacity: .4; cursor: not-allowed; }
+  .send svg { width: 18px; height: 18px; }
+  .hint {
+    display: flex; justify-content: space-between; gap: 12px;
+    font-size: 11.5px; color: var(--muted); padding: 6px 4px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .hint .over { color: var(--err); }
+
+  /* ── Settings dialog ────────────────────────────────── */
+  dialog {
+    width: min(440px, calc(100vw - 32px));
+    border: 1px solid var(--border); border-radius: 18px;
+    background: var(--surface); color: var(--text);
+    padding: 0; box-shadow: 0 20px 60px rgb(0 0 0 / .25);
+  }
+  dialog::backdrop { background: rgb(10 14 20 / .45); backdrop-filter: blur(2px); }
+  .dlg { padding: 22px; display: grid; gap: 16px; }
+  .dlg h2 { margin: 0; font-size: 18px; }
+  .dlg > p { margin: -8px 0 0; color: var(--muted); font-size: 13.5px; }
+  .field { display: grid; gap: 6px; }
+  .field label { font-size: 13px; font-weight: 600; }
+  .field .help { font-size: 12px; color: var(--muted); }
+  .input-wrap { position: relative; }
+  .input {
+    width: 100%; height: 40px; padding: 0 12px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  .input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .input-wrap .input { padding-right: 64px; }
+  .reveal {
+    position: absolute; right: 6px; top: 6px; height: 28px; padding: 0 8px;
+    border: 0; border-radius: 7px; background: var(--surface-2); font-size: 12px;
+  }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+  .form-error { display: none; color: var(--err); background: var(--err-soft); padding: 8px 10px; border-radius: 10px; font-size: 13px; }
+  .form-error.show { display: block; }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { height: 38px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); font-weight: 600; font-size: 14px; }
+  .btn.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+  .btn:disabled { opacity: .6; cursor: progress; }
+
+  @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .5 } 30% { transform: translateY(-4px); opacity: 1 } }
+  @keyframes pulse { 50% { opacity: .3 } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; scroll-behavior: auto !important; } }
+
+  @media (max-width: 600px) {
+    header { flex-wrap: wrap; padding: 12px 16px; }
+    .pills { order: 3; width: 100%; }
+    .icon-btn .label { display: none; }
+    .msg { max-width: 92%; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round"><path d="M5 8h14M5 13h10M5 18h6"/></svg>
+      </div>
+      <div>
+        <h1>Day12 Agent</h1>
+        <p id="version">Đang kết nối…</p>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="pills" role="status" aria-live="polite">
+      <span class="pill" id="pill-health" data-state="checking" title="Liveness — /health"><span class="dot"></span>Service</span>
+      <span class="pill" id="pill-ready" data-state="checking" title="Readiness — /ready (Redis)"><span class="dot"></span>Redis</span>
+    </div>
+    <button class="icon-btn" id="btn-new" type="button" title="Xóa lịch sử và bắt đầu lại">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      <span class="label">Mới</span>
+    </button>
+    <button class="icon-btn" id="btn-settings" type="button" title="API key và User ID">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+      <span class="label" id="user-label">Đăng nhập</span>
+    </button>
+  </header>
+
+  <main id="scroller">
+    <div class="log" id="log" role="log" aria-live="polite" aria-label="Hội thoại"></div>
+  </main>
+
+  <footer>
+    <div class="banner" id="banner" role="alert">
+      <div class="text"><span id="banner-text"></span><small id="banner-detail"></small></div>
+      <button type="button" id="banner-close" aria-label="Đóng thông báo">×</button>
+    </div>
+    <form class="composer" id="composer" autocomplete="off">
+      <label for="input" class="sr-only">Câu hỏi</label>
+      <textarea id="input" rows="1" maxlength="2000" placeholder="Hỏi agent điều gì đó…"></textarea>
+      <button class="send" id="send" type="submit" aria-label="Gửi" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </form>
+    <div class="hint">
+      <span id="stats">Enter để gửi · Shift+Enter xuống dòng</span>
+      <span id="counter">0/2000</span>
+    </div>
+  </footer>
+</div>
+
+<dialog id="settings" aria-labelledby="settings-title">
+  <form class="dlg" id="settings-form" method="dialog">
+    <h2 id="settings-title">Kết nối tới agent</h2>
+    <p>API key chỉ lưu trong trình duyệt này và chỉ gửi tới chính service này.</p>
+    <div class="field">
+      <label for="f-key">API key</label>
+      <div class="input-wrap">
+        <input class="input" id="f-key" type="password" required autocomplete="off" spellcheck="false" placeholder="Giá trị AGENT_API_KEY">
+        <button type="button" class="reveal" id="f-reveal" aria-pressed="false">Hiện</button>
+      </div>
+    </div>
+    <div class="field">
+      <label for="f-user">User ID</label>
+      <input class="input" id="f-user" maxlength="64" spellcheck="false" pattern="[A-Za-z0-9_.\-]+" placeholder="vd: quoc">
+      <span class="help">Mỗi user có lịch sử, hạn mức request và ngân sách riêng.</span>
+    </div>
+    <label class="check"><input type="checkbox" id="f-remember"> Ghi nhớ trên trình duyệt này</label>
+    <div class="form-error" id="f-error" role="alert"></div>
+    <div class="actions">
+      <button type="button" class="btn" id="f-cancel">Hủy</button>
+      <button type="submit" class="btn primary" id="f-save">Kết nối</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+(() => {
+  "use strict";
+  const MAX_HISTORY = 20;           // khớp HISTORY_MAX_MESSAGES trong app/store.py
+  const SUGGESTIONS = ["Deploy là gì?", "Vì sao cần rate limit?", "Docker multi-stage giúp gì?"];
+  const $ = (id) => document.getElementById(id);
+
+  // ── Lưu cấu hình phía trình duyệt (có thể bị chặn → luôn bọc try/catch) ──
+  const prefs = {
+    get(k) {
+      try { return sessionStorage.getItem(k) ?? localStorage.getItem(k); } catch { return null; }
+    },
+    save(values, remember) {
+      try {
+        const keep = remember ? localStorage : sessionStorage;
+        const drop = remember ? sessionStorage : localStorage;
+        for (const [k, v] of Object.entries(values)) { keep.setItem(k, v); drop.removeItem(k); }
+      } catch { /* chế độ riêng tư: chỉ giữ trong bộ nhớ */ }
+    },
+    remembered() { try { return localStorage.getItem("agent.key") !== null; } catch { return false; } },
+  };
+
+  const state = {
+    key: prefs.get("agent.key") || "",
+    user: prefs.get("agent.user") || "",
+    busy: false,
+    cooldownUntil: 0,
+    session: { asks: 0, tokens: 0, cost: 0 },
+    historyLen: 0,
+  };
+
+  // ── API ──
+  async function api(path, { method = "GET", body } = {}) {
+    const headers = { "X-API-Key": state.key };
+    if (state.user) headers["X-User-Id"] = state.user;
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    let res;
+    try {
+      res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    } catch {
+      return { ok: false, status: 0, data: null, requestId: null };
+    }
+    let data = null;
+    if (res.status !== 204) { try { data = await res.json(); } catch { /* không phải JSON */ } }
+    return { ok: res.ok, status: res.status, data, requestId: res.headers.get("X-Request-ID"), headers: res.headers };
+  }
+
+  // ── Trạng thái service ──
+  function setPill(el, stateName, label) {
+    el.dataset.state = stateName;
+    el.lastChild.textContent = label;
+  }
+  async function checkStatus() {
+    try {
+      const h = await fetch("/health", { cache: "no-store" });
+      const hd = await h.json();
+      setPill($("pill-health"), h.ok ? "ok" : "down", h.ok ? "Service" : "Đang tắt");
+      if (hd.version) $("version").textContent = `${hd.service} · v${hd.version}`;
+    } catch {
+      setPill($("pill-health"), "down", "Mất kết nối");
+      $("version").textContent = "Không kết nối được service";
+    }
+    try {
+      const r = await fetch("/ready", { cache: "no-store" });
+      setPill($("pill-ready"), r.ok ? "ok" : "down", r.ok ? "Redis" : "Redis lỗi");
+    } catch {
+      setPill($("pill-ready"), "down", "Redis ?");
+    }
+  }
+
+  // ── Render hội thoại ──
+  const log = $("log");
+  const scroller = $("scroller");
+  const scrollDown = () => requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+
+  function renderEmpty() {
+    log.replaceChildren();
+    const wrap = document.createElement("div");
+    wrap.className = "empty";
+    wrap.innerHTML = "<h2>Hỏi agent bất cứ điều gì</h2><p>Lịch sử được lưu trong Redis, nên tải lại trang hay đổi instance vẫn nhớ cuộc trò chuyện.</p>";
+    const chips = document.createElement("div");
+    chips.className = "chips";
+    for (const s of SUGGESTIONS) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "chip"; b.textContent = s;
+      b.addEventListener("click", () => { input.value = s; onInput(); send(); });
+      chips.append(b);
+    }
+    wrap.append(chips);
+    log.append(wrap);
+  }
+
+  function addMessage(role, text, meta) {
+    log.querySelector(".empty")?.remove();
+    const msg = document.createElement("div");
+    msg.className = `msg ${role}`;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;                 // textContent: không bao giờ chèn HTML từ server
+    msg.append(bubble);
+    if (meta) {
+      const m = document.createElement("div");
+      m.className = "meta"; m.textContent = meta;
+      msg.append(m);
+    }
+    log.append(msg);
+    scrollDown();
+    return msg;
+  }
+
+  function addTyping() {
+    log.querySelector(".empty")?.remove();
+    const msg = document.createElement("div");
+    msg.className = "msg assistant";
+    msg.innerHTML = '<div class="bubble" aria-label="Agent đang trả lời"><span class="typing"><span></span><span></span><span></span></span></div>';
+    log.append(msg);
+    scrollDown();
+    return msg;
+  }
+
+  const fmtCost = (c) => `$${Number(c).toFixed(6)}`;
+
+  function updateStats() {
+    const s = state.session;
+    const parts = [];
+    if (s.asks) parts.push(`Phiên này: ${s.asks} câu · ${s.tokens} token · ${fmtCost(s.cost)}`);
+    parts.push(`Redis giữ ${Math.min(state.historyLen, MAX_HISTORY)}/${MAX_HISTORY} tin nhắn`);
+    $("stats").textContent = parts.join(" · ");
+  }
+
+  async function loadHistory() {
+    const r = await api("/history");
+    if (r.status === 401) return openSettings("API key không hợp lệ. Nhập lại để tiếp tục.");
+    if (!r.ok) return showBanner("err", "Không tải được lịch sử hội thoại.", r.requestId);
+    const messages = r.data?.messages || [];
+    state.historyLen = messages.length;
+    if (!messages.length) { renderEmpty(); updateStats(); return; }
+    log.replaceChildren();
+    const d = document.createElement("div");
+    d.className = "divider"; d.textContent = "Lịch sử từ Redis";
+    log.append(d);
+    for (const m of messages) addMessage(m.role === "user" ? "user" : "assistant", m.content);
+    updateStats();
+  }
+
+  // ── Banner lỗi / cảnh báo ──
+  let bannerTimer = null;
+  function showBanner(kind, text, requestId) {
+    const b = $("banner");
+    b.dataset.kind = kind;
+    $("banner-text").textContent = text;
+    $("banner-detail").textContent = requestId ? `request_id: ${requestId}` : "";
+    b.classList.add("show");
+  }
+  function hideBanner() {
+    $("banner").classList.remove("show");
+    clearInterval(bannerTimer); bannerTimer = null;
+  }
+  $("banner-close").addEventListener("click", hideBanner);
+
+  function startCooldown(seconds, requestId) {
+    state.cooldownUntil = Date.now() + seconds * 1000;
+    clearInterval(bannerTimer);
+    const tick = () => {
+      const left = Math.ceil((state.cooldownUntil - Date.now()) / 1000);
+      if (left <= 0) { hideBanner(); state.cooldownUntil = 0; refreshSend(); return; }
+      showBanner("warn", `Bạn gửi quá nhanh (tối đa theo phút). Thử lại sau ${left}s — câu hỏi vẫn còn trong ô soạn thảo.`, requestId);
+      refreshSend();
+    };
+    tick();
+    bannerTimer = setInterval(tick, 1000);
+  }
+
+  // ── Composer ──
+  const input = $("input");
+  const sendBtn = $("send");
+  function refreshSend() {
+    const text = input.value.trim();
+    sendBtn.disabled = !text || state.busy || Date.now() < state.cooldownUntil || text.length > 2000;
+  }
+  function onInput() {
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+    const n = input.value.length;
+    const c = $("counter");
+    c.textContent = `${n}/2000`;
+    c.classList.toggle("over", n > 1900);
+    refreshSend();
+  }
+  input.addEventListener("input", onInput);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+  $("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+
+  async function send() {
+    const question = input.value.trim();
+    if (!question || state.busy || Date.now() < state.cooldownUntil) return;
+    if (!state.key) return openSettings();
+
+    state.busy = true;
+    hideBanner();
+    const userMsg = addMessage("user", question);
+    input.value = ""; onInput();
+    const typing = addTyping();
+
+    const r = await api("/ask", { method: "POST", body: { question } });
+    typing.remove();
+    state.busy = false;
+
+    if (r.ok) {
+      const d = r.data;
+      state.session.asks += 1;
+      state.session.tokens += d.tokens.in + d.tokens.out;
+      state.session.cost += d.cost_usd;
+      state.historyLen = d.history_length + 2;
+      addMessage("assistant", d.answer, `${d.tokens.in} → ${d.tokens.out} token · ${fmtCost(d.cost_usd)}`);
+      updateStats();
+      refreshSend();
+      input.focus();
+      return;
+    }
+
+    // Lỗi: trả câu hỏi về ô soạn thảo để người dùng không mất nội dung
+    userMsg.remove();
+    if (!log.children.length) renderEmpty();
+    input.value = question; onInput();
+
+    switch (r.status) {
+      case 401: openSettings("API key không hợp lệ hoặc đã bị đổi."); break;
+      case 429: startCooldown(Number(r.headers.get("Retry-After")) || 60, r.requestId); break;
+      case 402: showBanner("err", "User này đã dùng hết ngân sách tháng. Đổi User ID hoặc chờ sang tháng mới.", r.requestId); break;
+      case 422: showBanner("err", "Câu hỏi không hợp lệ (1–2000 ký tự).", r.requestId); break;
+      case 0: showBanner("err", "Không kết nối được service. Kiểm tra mạng rồi thử lại.", null); break;
+      default: showBanner("err", `Service gặp lỗi (${r.status}). Thử lại sau ít phút.`, r.requestId);
+    }
+    refreshSend();
+  }
+
+  // ── Mới ──
+  $("btn-new").addEventListener("click", async () => {
+    if (!state.key) return openSettings();
+    if (state.historyLen && !confirm("Xóa lịch sử hội thoại của user này và bắt đầu lại?")) return;
+    const r = await api("/history", { method: "DELETE" });
+    if (r.status === 401) return openSettings("API key không hợp lệ.");
+    if (!r.ok) return showBanner("err", "Không xóa được lịch sử.", r.requestId);
+    state.historyLen = 0;
+    state.session = { asks: 0, tokens: 0, cost: 0 };
+    hideBanner(); renderEmpty(); updateStats(); input.focus();
+  });
+
+  // ── Cài đặt ──
+  const dlg = $("settings");
+  function openSettings(error) {
+    $("f-key").value = state.key;
+    $("f-user").value = state.user || `web-${Math.random().toString(36).slice(2, 6)}`;
+    $("f-remember").checked = prefs.remembered();
+    const fe = $("f-error");
+    fe.textContent = error || ""; fe.classList.toggle("show", Boolean(error));
+    $("f-cancel").hidden = !state.key;
+    if (!dlg.open) dlg.showModal();
+    (state.key ? $("f-user") : $("f-key")).focus();
+  }
+  $("btn-settings").addEventListener("click", () => openSettings());
+  $("f-cancel").addEventListener("click", () => dlg.close());
+  dlg.addEventListener("cancel", (e) => { if (!state.key) e.preventDefault(); });
+  $("f-reveal").addEventListener("click", (e) => {
+    const f = $("f-key"); const show = f.type === "password";
+    f.type = show ? "text" : "password";
+    e.currentTarget.textContent = show ? "Ẩn" : "Hiện";
+    e.currentTarget.setAttribute("aria-pressed", String(show));
+  });
+
+  $("settings-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const key = $("f-key").value.trim();
+    const user = $("f-user").value.trim();
+    const fe = $("f-error");
+    if (!key) return;
+    if (user && !/^[A-Za-z0-9_.\-]+$/.test(user)) {
+      fe.textContent = "User ID chỉ gồm chữ không dấu, số, dấu . _ -"; fe.classList.add("show"); return;
+    }
+    const prev = { key: state.key, user: state.user };
+    Object.assign(state, { key, user });
+    const btn = $("f-save"); btn.disabled = true; btn.textContent = "Đang kiểm tra…";
+    const r = await api("/history");
+    btn.disabled = false; btn.textContent = "Kết nối";
+    if (r.status === 401) {
+      Object.assign(state, prev);
+      fe.textContent = "API key không đúng."; fe.classList.add("show"); $("f-key").select(); return;
+    }
+    if (!r.ok) {
+      Object.assign(state, prev);
+      fe.textContent = r.status ? `Service trả lỗi ${r.status}.` : "Không kết nối được service.";
+      fe.classList.add("show"); return;
+    }
+    prefs.save({ "agent.key": key, "agent.user": user }, $("f-remember").checked);
+    $("user-label").textContent = user || "anonymous";
+    state.session = { asks: 0, tokens: 0, cost: 0 };
+    dlg.close();
+    await loadHistory();
+    input.focus();
+  });
+
+  // ── Khởi động ──
+  renderEmpty();
+  updateStats();
+  checkStatus();
+  setInterval(checkStatus, 30000);
+  if (state.key) {
+    $("user-label").textContent = state.user || "anonymous";
+    loadHistory();
+  } else {
+    openSettings();
+  }
+})();
+</script>
+</body>
+</html>

@@ -36,7 +36,10 @@ class RateLimiter:
              ``self.client.zremrangebyscore(key, 0, now - WINDOW_SECONDS)``
           3. Trả về ``self.client.zcard(key)``
         """
-        raise NotImplementedError("TODO (CP3): cài đặt hit_count")
+        now = now if now is not None else time.time()
+        key = self._key(user_id)
+        self.client.zremrangebyscore(key, 0, now - WINDOW_SECONDS)
+        return int(self.client.zcard(key))
 
     def check(self, user_id: str, now: float | None = None) -> None:
         """Cho qua nếu còn quota, ngược lại raise 429.
@@ -56,4 +59,32 @@ class RateLimiter:
         Lưu ý thứ tự: **kiểm tra trước, ghi nhận sau**. Ghi trước rồi mới đếm
         sẽ chặn nhầm ngay ở request thứ ``limit``.
         """
-        raise NotImplementedError("TODO (CP3): cài đặt check")
+        now = now if now is not None else time.time()
+        key = self._key(user_id)
+        member = f"{now}:{uuid.uuid4().hex}"
+
+        # Dọn + ghi + đếm trong MỘT transaction (MULTI/EXEC). Nếu tách thành
+        # "đếm rồi mới ghi", hai instance cùng lúc có thể cùng thấy còn quota
+        # và cùng cho qua → vượt hạn mức khi scale ngang.
+        pipe = self.client.pipeline(transaction=True)
+        pipe.zremrangebyscore(key, 0, now - WINDOW_SECONDS)
+        pipe.zadd(key, {member: now})
+        pipe.zcard(key)
+        pipe.expire(key, WINDOW_SECONDS)
+        _, _, count, _ = pipe.execute()
+
+        if count > self.limit:
+            # Request bị chặn không được tính vào quota
+            self.client.zrem(key, member)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="rate limit exceeded",
+                headers={"Retry-After": str(self._retry_after(key, now))},
+            )
+
+    def _retry_after(self, key: str, now: float) -> int:
+        """Số giây tới khi request cũ nhất rời khỏi cửa sổ (tối thiểu 1)."""
+        oldest = self.client.zrange(key, 0, 0, withscores=True)
+        if not oldest:
+            return WINDOW_SECONDS
+        return max(1, int(oldest[0][1] + WINDOW_SECONDS - now) + 1)

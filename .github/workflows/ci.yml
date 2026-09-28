@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Push liên tiếp lên cùng nhánh → hủy lần chạy cũ, không deploy chồng chéo
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      # Giá trị giả chỉ để Settings() khởi tạo được trong CI, không phải secret thật
+      AGENT_API_KEY: ci-dummy
+      REDIS_URL: fake://
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests (CP1–CP4, bỏ test cần bản deploy và test build Docker)
+        run: pytest tests/test_cp1.py tests/test_cp2.py tests/test_cp3.py tests/test_cp4.py -v -m "not docker"
+
+  build:
+    name: Build & smoke test image
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      IMAGE: day12-agent:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t "$IMAGE" .
+      - name: Check image size (< 500MB)
+        run: |
+          size=$(docker image inspect "$IMAGE" --format '{{.Size}}')
+          echo "Image size: $((size / 1024 / 1024)) MB"
+          test "$size" -lt $((500 * 1024 * 1024))
+      - name: Smoke test container (real Redis, non-default PORT)
+        run: |
+          docker network create smoke
+          docker run -d --name redis --network smoke redis:7-alpine
+          docker run -d --name agent --network smoke -p 9000:9000 \
+            -e PORT=9000 -e AGENT_API_KEY=smoke -e REDIS_URL=redis://redis:6379/0 "$IMAGE"
+          for i in $(seq 1 20); do
+            curl -fsS http://localhost:9000/ready && break
+            sleep 1
+          done
+          curl -fsS http://localhost:9000/health
+          test "$(docker exec agent whoami)" = "app"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:9000/ask \
+            -H 'Content-Type: application/json' -d '{"question":"hi"}')" = "401"
+          curl -fsS -X POST http://localhost:9000/ask \
+            -H 'Content-Type: application/json' -H 'X-API-Key: smoke' \
+            -d '{"question":"hi"}'
+      - name: Container logs
+        if: always()
+        run: docker logs agent || true
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL chưa được set trong GitHub Secrets — bỏ qua deploy"
+            exit 0
+          fi
+          curl -fsS -X POST "$DEPLOY_HOOK_URL"

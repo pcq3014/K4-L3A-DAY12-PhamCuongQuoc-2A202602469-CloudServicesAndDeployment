@@ -13,10 +13,12 @@ Luồng một request tới /ask:
 
 from __future__ import annotations
 
+import time
+import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -66,6 +68,40 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Day 12 Production Agent", version=SERVICE_VERSION, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """Mỗi request một dòng log JSON kèm request_id và thời gian xử lý.
+
+    request_id lấy từ header X-Request-ID nếu load balancer đã gắn, không thì
+    tự sinh, và trả lại trong response để đối chiếu log khi user báo lỗi.
+    """
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as err:
+        log_event(
+            "request_failed",
+            level="error",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            error=type(err).__name__,
+        )
+        # Không trả traceback ra ngoài — chi tiết đã nằm trong log
+        response = JSONResponse(status_code=500, content={"detail": "internal server error"})
+    response.headers["X-Request-ID"] = request_id
+    log_event(
+        "request_completed",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
+    return response
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
 
@@ -87,7 +123,9 @@ def health():
     lời câu hỏi "có cần restart container này không?". Nếu nó phụ thuộc
     Redis, Redis chết một nhịp là cả cụm container bị restart theo.
     """
-    raise NotImplementedError("TODO (CP1/CP4): cài đặt /health")
+    if lifecycle.shutting_down:
+        return JSONResponse(status_code=503, content={"status": "shutting_down"})
+    return {"status": "ok", "service": SERVICE_NAME, "version": SERVICE_VERSION}
 
 
 @app.get("/ready")
@@ -102,7 +140,11 @@ def ready(store: ConversationStore = Depends(get_store)):
     Khác /health ở chỗ: endpoint này ĐƯỢC PHÉP kiểm tra dependency. Load
     balancer dùng nó để quyết định có đẩy request vào instance này không.
     """
-    raise NotImplementedError("TODO (CP4): cài đặt /ready")
+    if lifecycle.shutting_down:
+        return JSONResponse(status_code=503, content={"status": "shutting_down"})
+    if not store.ping():
+        return JSONResponse(status_code=503, content={"status": "not ready", "redis": False})
+    return {"status": "ready", "redis": True}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -145,7 +187,30 @@ def ask(
     ``user_id`` do ``verify_api_key`` trả về, nên request không có API key
     hợp lệ sẽ dừng ở 401 trước khi chạm vào bất cứ dòng nào ở đây.
     """
-    raise NotImplementedError("TODO (CP3/CP4): cài đặt /ask")
+    limiter.check(user_id)
+    guard.check(user_id)
+
+    history = store.get_history(user_id)
+    result = ask_llm(payload.question, history)
+
+    store.append(user_id, "user", payload.question)
+    store.append(user_id, "assistant", result["answer"])
+    guard.record(user_id, result["cost_usd"])
+
+    log_event(
+        "ask_completed",
+        user_id=user_id,
+        tokens_in=result["tokens_in"],
+        tokens_out=result["tokens_out"],
+        cost_usd=result["cost_usd"],
+    )
+    return {
+        "answer": result["answer"],
+        "user_id": user_id,
+        "history_length": len(history),
+        "cost_usd": result["cost_usd"],
+        "tokens": {"in": result["tokens_in"], "out": result["tokens_out"]},
+    }
 
 
 if __name__ == "__main__":
